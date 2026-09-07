@@ -182,6 +182,7 @@ struct Connection {
     stats: Arc<Stats>,
     txs_limit: usize,
     subscription_limit: usize,
+    max_request_bytes: usize,
     #[cfg(feature = "electrum-discovery")]
     discovery: Option<Arc<DiscoveryManager>>,
     rpc_logging: RpcLogging,
@@ -204,6 +205,7 @@ impl Connection {
         stats: Arc<Stats>,
         txs_limit: usize,
         subscription_limit: usize,
+        max_request_bytes: usize,
         #[cfg(feature = "electrum-discovery")] discovery: Option<Arc<DiscoveryManager>>,
         rpc_logging: RpcLogging,
         salt: String,
@@ -218,6 +220,7 @@ impl Connection {
             stats,
             txs_limit,
             subscription_limit,
+            max_request_bytes,
             #[cfg(feature = "electrum-discovery")]
             discovery,
             rpc_logging,
@@ -784,13 +787,51 @@ impl Connection {
         }
     }
 
-    #[trace]
-    fn parse_requests(mut reader: BufReader<TcpStream>, tx: &SyncSender<Message>) -> Result<()> {
+    fn read_bounded_line(reader: &mut BufReader<TcpStream>, max_len: usize) -> Result<Vec<u8>> {
+        let mut line = Vec::<u8>::new();
         loop {
-            let mut line = Vec::<u8>::new();
-            reader
-                .read_until(b'\n', &mut line)
-                .chain_err(|| "failed to read a request")?;
+            let (done, consumed) = {
+                let available = reader.fill_buf().chain_err(|| "failed to read a request")?;
+                if available.is_empty() {
+                    (true, 0) // EOF
+                } else if let Some(pos) = available.iter().position(|&b| b == b'\n') {
+                    let new_len = line
+                        .len()
+                        .checked_add(pos + 1)
+                        .ok_or_else(|| "request line length overflow")?;
+                    if new_len > max_len {
+                        bail!("request line exceeds maximum size of {} bytes", max_len);
+                    }
+                    line.extend_from_slice(&available[..=pos]);
+                    (true, pos + 1)
+                } else {
+                    let new_len = line
+                        .len()
+                        .checked_add(available.len())
+                        .ok_or_else(|| "request line length overflow")?;
+                    if new_len > max_len {
+                        bail!("request line exceeds maximum size of {} bytes", max_len);
+                    }
+                    let take = available.len();
+                    line.extend_from_slice(&available[..take]);
+                    (false, take)
+                }
+            };
+            reader.consume(consumed);
+            if done {
+                return Ok(line);
+            }
+        }
+    }
+
+    #[trace]
+    fn parse_requests(
+        mut reader: BufReader<TcpStream>,
+        tx: &SyncSender<Message>,
+        max_request_bytes: usize,
+    ) -> Result<()> {
+        loop {
+            let line = Connection::read_bounded_line(&mut reader, max_request_bytes)?;
             if line.is_empty() {
                 return Ok(());
             } else {
@@ -810,8 +851,12 @@ impl Connection {
         }
     }
 
-    fn reader_thread(reader: BufReader<TcpStream>, tx: SyncSender<Message>) -> Result<()> {
-        let result = Connection::parse_requests(reader, &tx);
+    fn reader_thread(
+        reader: BufReader<TcpStream>,
+        tx: SyncSender<Message>,
+        max_request_bytes: usize,
+    ) -> Result<()> {
+        let result = Connection::parse_requests(reader, &tx, max_request_bytes);
         if let Err(e) = tx.send(Message::Done) {
             // The writer already tore the channel down (e.g. after a write
             // error or connection expiry) — expected during teardown races.
@@ -826,7 +871,10 @@ impl Connection {
 
         let reader = BufReader::new(self.stream.try_clone().expect("failed to clone TcpStream"));
         let sender = self.sender.clone();
-        let child = spawn_thread("reader", || Connection::reader_thread(reader, sender));
+        let max_request_bytes = self.max_request_bytes;
+        let child = spawn_thread("reader", move || {
+            Connection::reader_thread(reader, sender, max_request_bytes)
+        });
         if let Err(e) = self.handle_replies(receiver) {
             if is_disconnect(&e) {
                 // client went away mid-exchange (broken pipe / reset) — not actionable
@@ -1189,6 +1237,7 @@ impl RPC {
         let rpc_addr = config.electrum_rpc_addr;
         let txs_limit = config.electrum_txs_limit;
         let subscription_limit = config.electrum_subscription_limit;
+        let max_request_bytes = config.electrum_rpc_max_request_num_bytes;
         let conn_max_age = config.electrum_rpc_conn_max_age;
 
         RPC {
@@ -1240,6 +1289,7 @@ impl RPC {
                             stats,
                             txs_limit,
                             subscription_limit,
+                            max_request_bytes,
                             #[cfg(feature = "electrum-discovery")]
                             discovery,
                             rpc_logging,
@@ -1511,5 +1561,128 @@ mod tests {
         // (leaking the fd) until the deadline.
         drop(stream);
         assert!(weak.upgrade().is_none());
+    }
+
+    #[test]
+    fn read_bounded_line_reads_a_normal_line() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let mut reader = BufReader::new(listener.accept().unwrap().0);
+
+        client.write_all(b"hello world\n").unwrap();
+        let line = Connection::read_bounded_line(&mut reader, 1024).unwrap();
+        assert_eq!(line, b"hello world\n");
+    }
+
+    #[test]
+    fn read_bounded_line_rejects_a_line_without_a_newline_past_the_limit() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let mut reader = BufReader::new(listener.accept().unwrap().0);
+
+        // Stream well past the limit with no '\n': the never-terminated-line
+        // OOM this guards against.
+        let chunk = [b'A'; 4096];
+        let writer = thread::spawn(move || {
+            for _ in 0..64 {
+                if client.write_all(&chunk).is_err() {
+                    break;
+                }
+            }
+        });
+
+        let err = Connection::read_bounded_line(&mut reader, 1024).unwrap_err();
+        assert!(err.to_string().contains("exceeds maximum size"));
+        let _ = writer.join();
+    }
+
+    #[test]
+    fn read_bounded_line_rejects_a_line_whose_terminating_newline_arrives_over_the_limit() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let mut reader = BufReader::new(listener.accept().unwrap().0);
+
+        // The '\n' lands in the same fill_buf() chunk that pushes the
+        // accumulated line past the limit, so `done` is true on the very
+        // iteration where the size check must fire.
+        let mut payload = vec![b'A'; 2048];
+        payload.push(b'\n');
+        client.write_all(&payload).unwrap();
+
+        let err = Connection::read_bounded_line(&mut reader, 1024).unwrap_err();
+        assert!(err.to_string().contains("exceeds maximum size"));
+    }
+
+    #[test]
+    fn read_bounded_line_returns_empty_on_immediate_eof() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let mut reader = BufReader::new(listener.accept().unwrap().0);
+
+        drop(client);
+        let line = Connection::read_bounded_line(&mut reader, 1024).unwrap();
+        assert!(line.is_empty());
+    }
+
+    #[test]
+    fn read_bounded_line_returns_partial_line_on_eof_without_newline() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let mut reader = BufReader::new(listener.accept().unwrap().0);
+
+        client.write_all(b"no newline here").unwrap();
+        drop(client);
+
+        let line = Connection::read_bounded_line(&mut reader, 1024).unwrap();
+        assert_eq!(line, b"no newline here");
+    }
+
+    #[test]
+    fn read_bounded_line_accepts_a_line_exactly_at_the_limit() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let mut reader = BufReader::new(listener.accept().unwrap().0);
+
+        let payload = vec![b'A'; 1024];
+        client.write_all(&payload).unwrap();
+        drop(client);
+
+        let line = Connection::read_bounded_line(&mut reader, 1024).unwrap();
+        assert_eq!(line, payload);
+    }
+
+    #[test]
+    fn read_bounded_line_rejects_a_single_chunk_exceeding_a_small_limit() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let mut reader = BufReader::new(listener.accept().unwrap().0);
+
+        // A single write, well within the reader's default 8KiB buffer, that
+        // still lands entirely in one fill_buf() call and exceeds a limit
+        // much smaller than that buffer.
+        let payload = vec![b'A'; 500];
+        client.write_all(&payload).unwrap();
+
+        let err = Connection::read_bounded_line(&mut reader, 100).unwrap_err();
+        assert!(err.to_string().contains("exceeds maximum size"));
+    }
+
+    #[test]
+    fn read_bounded_line_handles_unlimited_max_len_split_across_writes() {
+        // max_len == usize::MAX is what a configured value of 0 ("unlimited")
+        // maps to. Splitting the request and its terminating newline across
+        // separate writes forces at least one fill_buf() call to return a
+        // newline-less chunk, which used to compute `max_len + 1` and
+        // overflow.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let mut reader = BufReader::new(listener.accept().unwrap().0);
+
+        client.write_all(b"server.ping").unwrap();
+        thread::sleep(Duration::from_millis(50));
+        client.write_all(b"\n").unwrap();
+
+        let line = Connection::read_bounded_line(&mut reader, usize::MAX).unwrap();
+        assert_eq!(line, b"server.ping\n");
     }
 }
