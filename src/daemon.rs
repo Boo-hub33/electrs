@@ -1,7 +1,7 @@
 use std::cell::OnceCell;
 use std::collections::{HashMap, HashSet};
 use std::convert::TryFrom;
-use std::io::{BufRead, BufReader, Lines, Write};
+use std::io::{BufRead, BufReader, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -63,6 +63,26 @@ lazy_static! {
     static ref DAEMON_PROXY_QUEUE_TIMEOUT: Duration = Duration::from_secs(
         env::var("DAEMON_PROXY_QUEUE_TIMEOUT").map_or(5, |s| s.parse().unwrap())
     );
+    // Caps on what a single daemon HTTP response may make us buffer. The RPC channel is
+    // plaintext with no server authentication, so the peer is only as trustworthy as the
+    // network path to it. Environment variables to match the timeouts above; these could
+    // equally be `--daemon-*` CLI flags if operators want them in `--help`.
+    //
+    // bitcoind's header lines are well under 200 bytes.
+    static ref DAEMON_MAX_HEADER_LINE_BYTES: usize =
+        env::var("DAEMON_MAX_HEADER_LINE_BYTES").map_or(8 * 1024, |s| s.parse().unwrap());
+    // Both a count and a byte cap, so neither many short headers nor a few long ones can
+    // grow the map without bound.
+    static ref DAEMON_MAX_HEADER_COUNT: usize =
+        env::var("DAEMON_MAX_HEADER_COUNT").map_or(100, |s| s.parse().unwrap());
+    static ref DAEMON_MAX_HEADER_TOTAL_BYTES: usize =
+        env::var("DAEMON_MAX_HEADER_TOTAL_BYTES").map_or(64 * 1024, |s| s.parse().unwrap());
+    // The largest legitimate reply is a `getblock` with verbose=false, which is hex and so
+    // roughly twice the block size (~8 MB for a maximal block), or a `getrawmempool` listing
+    // during heavy congestion (tens of MB). Requests are issued individually rather than
+    // JSON-RPC batched, so one response is never N blocks.
+    static ref DAEMON_MAX_BODY_BYTES: usize =
+        env::var("DAEMON_MAX_BODY_BYTES").map_or(128 * 1024 * 1024, |s| s.parse().unwrap());
 }
 
 const MAX_ATTEMPTS: u32 = 5;
@@ -281,7 +301,7 @@ impl ConnectionConfig {
 
 struct Connection {
     tx: TcpStream,
-    rx: Lines<BufReader<TcpStream>>,
+    rx: BufReader<TcpStream>,
     cookie_getter: Arc<dyn CookieGetter>,
     addr: SocketAddr,
     fallback: Option<SocketAddr>,
@@ -297,12 +317,163 @@ struct Connection {
     // When the last *failed* proactive recycle attempt happened, used to rate-limit retries
     // (see `DAEMON_CONN_RECYCLE_COOLDOWN`). None until a recycle attempt fails.
     last_recycle_attempt: Option<Instant>,
+    // Wall-clock budget for one whole `recv`, taken from the socket read timeout. That timeout
+    // only bounds a single read syscall, so a peer that keeps trickling bytes resets it
+    // indefinitely and pins the calling thread.
+    recv_budget: Duration,
 }
 
 fn configure_stream(conn: &TcpStream) {
     // can only fail if DAEMON_TIMEOUT is 0
     conn.set_read_timeout(Some(*DAEMON_READ_TIMEOUT)).unwrap();
     conn.set_write_timeout(Some(*DAEMON_WRITE_TIMEOUT)).unwrap();
+}
+
+/// Shrink the socket read timeout to whatever is left of `deadline`, returning false once
+/// nothing is. Called before every blocking read: the socket timeout bounds one syscall, so
+/// checking the deadline only between reads lets a peer that sends a byte just before it
+/// expires buy itself another full timeout.
+fn arm_read_deadline(reader: &BufReader<TcpStream>, deadline: Instant) -> Result<bool> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return Ok(false);
+    }
+    reader
+        .get_ref()
+        .set_read_timeout(Some(remaining))
+        .chain_err(|| ErrorKind::Connection("failed to arm the daemon read deadline".to_owned()))?;
+    Ok(true)
+}
+
+/// Read one `\n`-terminated line, refusing to buffer more than `max_len` bytes and giving
+/// up at `deadline`. Returns `Ok(None)` at a clean EOF before any bytes arrive.
+///
+/// The budget is checked before the buffer grows rather than after, so an oversized line is
+/// refused without ever being allocated. The trailing `\r\n` or `\n` is stripped.
+fn read_line_bounded(
+    reader: &mut BufReader<TcpStream>,
+    max_len: usize,
+    deadline: Instant,
+) -> Result<Option<String>> {
+    let mut raw: Vec<u8> = Vec::new();
+    loop {
+        if !arm_read_deadline(reader, deadline)? {
+            bail!(ErrorKind::Connection(format!(
+                "daemon response deadline exceeded while reading a line bytes_read='{}'",
+                raw.len()
+            )));
+        }
+        let (chunk_len, done) = {
+            let available = match reader.fill_buf() {
+                Ok(buf) => buf,
+                Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                // The armed timeout fired. Re-arm and retry: if that was the deadline the
+                // next pass reports it, and if time is left this was a short read.
+                Err(ref e)
+                    if matches!(
+                        e.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    continue
+                }
+                Err(e) => {
+                    return Err(e).chain_err(|| {
+                        ErrorKind::Connection("failed to read from daemon".to_owned())
+                    })
+                }
+            };
+            if available.is_empty() {
+                (0, true) // EOF
+            } else {
+                let (len, found_newline) = match available.iter().position(|&b| b == b'\n') {
+                    Some(i) => (i + 1, true),
+                    None => (available.len(), false),
+                };
+                if raw.len() + len > max_len {
+                    bail!(ErrorKind::Connection(format!(
+                        "daemon response line exceeds cap bytes='{}' max_bytes='{}'",
+                        raw.len() + len,
+                        max_len
+                    )));
+                }
+                raw.extend_from_slice(&available[..len]);
+                (len, found_newline)
+            }
+        };
+        reader.consume(chunk_len);
+        if done {
+            if chunk_len == 0 && raw.is_empty() {
+                return Ok(None);
+            }
+            break;
+        }
+    }
+
+    if raw.last() == Some(&b'\n') {
+        raw.pop();
+    }
+    if raw.last() == Some(&b'\r') {
+        raw.pop();
+    }
+    String::from_utf8(raw)
+        .map(Some)
+        .chain_err(|| ErrorKind::Connection("daemon sent a non-UTF8 response line".to_owned()))
+}
+
+/// Read exactly `len` bytes, giving up at `deadline`. Returns short only on EOF, which the
+/// caller reports as a truncated response. `len` is the already-validated `Content-Length`,
+/// so the allocation is bounded by the cap rather than by what the peer chooses to send.
+fn read_body_bounded(
+    reader: &mut BufReader<TcpStream>,
+    len: usize,
+    deadline: Instant,
+) -> Result<Vec<u8>> {
+    // Grow into the buffer as bytes arrive rather than reserving `len` up front, so a large
+    // declared length that is never delivered costs nothing.
+    let mut body: Vec<u8> = Vec::with_capacity(len.min(64 * 1024));
+    while body.len() < len {
+        if !arm_read_deadline(reader, deadline)? {
+            bail!(ErrorKind::Connection(format!(
+                "daemon response deadline exceeded while reading the body bytes_read='{}' expected_bytes='{}'",
+                body.len(),
+                len
+            )));
+        }
+        let chunk_len = {
+            let available = match reader.fill_buf() {
+                Ok(buf) => buf,
+                Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                // The armed timeout fired. Re-arm and retry: if that was the deadline the
+                // next pass reports it, and if time is left this was a short read.
+                Err(ref e)
+                    if matches!(
+                        e.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    continue
+                }
+                Err(e) => {
+                    return Err(e).chain_err(|| {
+                        ErrorKind::Connection("failed to read from daemon".to_owned())
+                    })
+                }
+            };
+            if available.is_empty() {
+                0 // EOF
+            } else {
+                let take = available.len().min(len - body.len());
+                body.extend_from_slice(&available[..take]);
+                take
+            }
+        };
+        if chunk_len == 0 {
+            break;
+        }
+        reader.consume(chunk_len);
+    }
+    Ok(body)
 }
 
 /// Attempt a single connection to the primary address, falling back to the fallback
@@ -418,9 +589,16 @@ impl Connection {
             conn.try_clone()
                 .chain_err(|| format!("failed to clone {:?}", conn))?,
         );
+        // One-shot connections carry a much shorter timeout than the indexer's, so deriving
+        // the budget from the socket keeps each caller's existing latency expectations.
+        let recv_budget = conn
+            .read_timeout()
+            .ok()
+            .flatten()
+            .unwrap_or(*DAEMON_READ_TIMEOUT);
         Ok(Connection {
             tx: conn,
-            rx: reader.lines(),
+            rx: reader,
             cookie_getter,
             addr,
             fallback,
@@ -429,6 +607,7 @@ impl Connection {
             established: Instant::now(),
             max_age,
             last_recycle_attempt: None,
+            recv_budget,
         })
     }
 
@@ -489,36 +668,56 @@ impl Connection {
 
     #[trace]
     fn recv(&mut self) -> Result<String> {
+        // The read helpers shrink the socket timeout as the deadline approaches, so put it
+        // back on the way out and leave the socket as `configure_stream` set it.
+        let restore = self.rx.get_ref().read_timeout().ok().flatten();
+        let result = self.recv_within(Instant::now() + self.recv_budget);
+        let _ = self.rx.get_ref().set_read_timeout(restore);
+        result
+    }
+
+    fn recv_within(&mut self, deadline: Instant) -> Result<String> {
         // TODO: use proper HTTP parser.
-        let mut in_header = true;
-        let mut contents: Option<String> = None;
-        let iter = self.rx.by_ref();
-        let status = iter
-            .next()
+        let status = read_line_bounded(&mut self.rx, *DAEMON_MAX_HEADER_LINE_BYTES, deadline)?
             .chain_err(|| {
                 ErrorKind::Connection("disconnected from daemon while receiving".to_owned())
-            })?
-            .chain_err(|| ErrorKind::Connection("failed to read status".to_owned()))?;
+            })?;
+
         let mut headers = HashMap::new();
-        for line in iter {
-            let line = line.chain_err(|| ErrorKind::Connection("failed to read".to_owned()))?;
+        let mut header_count = 0usize;
+        let mut header_bytes = 0usize;
+        loop {
+            let line = read_line_bounded(&mut self.rx, *DAEMON_MAX_HEADER_LINE_BYTES, deadline)?
+                .chain_err(|| {
+                    ErrorKind::Connection(
+                        "disconnected from daemon while reading headers".to_owned(),
+                    )
+                })?;
             if line.is_empty() {
-                in_header = false; // next line should contain the actual response.
-            } else if in_header {
-                let parts: Vec<&str> = line.splitn(2, ": ").collect();
-                if parts.len() == 2 {
-                    headers.insert(parts[0].to_lowercase(), parts[1].to_owned());
-                } else {
-                    warn!("invalid header: {:?}", line);
-                }
+                break; // end of the header section, the body follows
+            }
+            header_count += 1;
+            header_bytes += line.len();
+            if header_count > *DAEMON_MAX_HEADER_COUNT {
+                bail!(ErrorKind::Connection(format!(
+                    "daemon sent too many response headers count='{}' max_count='{}'",
+                    header_count, *DAEMON_MAX_HEADER_COUNT
+                )));
+            }
+            if header_bytes > *DAEMON_MAX_HEADER_TOTAL_BYTES {
+                bail!(ErrorKind::Connection(format!(
+                    "daemon response headers exceed cap bytes='{}' max_bytes='{}'",
+                    header_bytes, *DAEMON_MAX_HEADER_TOTAL_BYTES
+                )));
+            }
+            let parts: Vec<&str> = line.splitn(2, ": ").collect();
+            if parts.len() == 2 {
+                headers.insert(parts[0].to_lowercase(), parts[1].to_owned());
             } else {
-                contents = Some(line);
-                break;
+                warn!("invalid header: {:?}", line);
             }
         }
 
-        let contents =
-            contents.chain_err(|| ErrorKind::Connection("no reply from daemon".to_owned()))?;
         let contents_length: &str = headers
             .get("content-length")
             .chain_err(|| format!("Content-Length is missing: {:?}", headers))?;
@@ -526,14 +725,38 @@ impl Connection {
             .parse()
             .chain_err(|| format!("invalid Content-Length: {:?}", contents_length))?;
 
-        let expected_length = contents_length - 1; // trailing EOL is skipped
-        if expected_length != contents.len() {
+        // A zero length leaves no room for the trailing EOL that bitcoind always sends,
+        // so it cannot be a well-formed reply.
+        if contents_length == 0 {
+            bail!(ErrorKind::Connection(
+                "daemon sent an empty response body content_length='0'".to_owned()
+            ));
+        }
+        if contents_length > *DAEMON_MAX_BODY_BYTES {
             bail!(ErrorKind::Connection(format!(
-                "expected {} bytes, got {}",
-                expected_length,
-                contents.len()
+                "daemon response body exceeds cap content_length='{}' max_bytes='{}'",
+                contents_length, *DAEMON_MAX_BODY_BYTES
             )));
         }
+
+        let mut body = read_body_bounded(&mut self.rx, contents_length, deadline)?;
+        if body.len() != contents_length {
+            bail!(ErrorKind::Connection(format!(
+                "truncated daemon response expected_bytes='{}' got_bytes='{}'",
+                contents_length,
+                body.len()
+            )));
+        }
+        // Content-Length covers the trailing EOL, which is not part of the JSON payload.
+        if body.last() == Some(&b'\n') {
+            body.pop();
+        }
+        if body.last() == Some(&b'\r') {
+            body.pop();
+        }
+        let contents = String::from_utf8(body).chain_err(|| {
+            ErrorKind::Connection("daemon sent a non-UTF8 response body".to_owned())
+        })?;
 
         Ok(if status == "HTTP/1.1 200 OK" {
             contents
@@ -1321,12 +1544,14 @@ impl Daemon {
 #[cfg(test)]
 mod tests {
     use super::{
-        parse_jsonrpc_reply, recycle_due, BlockingSemaphore, ConnectionConfig, CookieGetter,
+        parse_jsonrpc_reply, recycle_due, BlockingSemaphore, Connection, ConnectionConfig,
+        CookieGetter, DAEMON_MAX_BODY_BYTES, DAEMON_MAX_HEADER_LINE_BYTES,
     };
     use crate::errors::{Error, ErrorKind, Result};
     use crate::signal::Waiter;
     use serde_json::json;
-    use std::net::TcpListener;
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
     use std::sync::Arc;
     use std::thread;
     use std::time::{Duration, Instant};
@@ -1336,6 +1561,49 @@ mod tests {
 
     fn secs(n: u64) -> Duration {
         Duration::from_secs(n)
+    }
+
+    fn millis(n: u64) -> Duration {
+        Duration::from_millis(n)
+    }
+
+    /// Spawn a fake daemon that runs `respond` against the accepted socket, and hand back a
+    /// one-shot `Connection` pointed at it. The connection's I/O timeout doubles as its
+    /// whole-request `recv` budget, so `io_timeout` is what the deadline tests turn on.
+    fn fake_daemon<F>(io_timeout: Duration, respond: F) -> (Connection, thread::JoinHandle<()>)
+    where
+        F: FnOnce(TcpStream) + Send + 'static,
+    {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (socket, _) = listener.accept().unwrap();
+            respond(socket);
+        });
+
+        let config = ConnectionConfig {
+            addr,
+            fallback: None,
+            cookie_getter: Arc::new(StaticCookie),
+            signal: Waiter::start(crossbeam_channel::never()),
+            max_age: None,
+        };
+
+        (config.connect_once(io_timeout).unwrap(), server)
+    }
+
+    /// Go silent until the client hangs up, so the responder thread joins promptly instead
+    /// of the test paying for a fixed sleep.
+    fn wait_for_close(mut socket: TcpStream) {
+        let mut sink = [0u8; 1];
+        while matches!(socket.read(&mut sink), Ok(n) if n > 0) {}
+    }
+
+    fn connection_error(err: &Error) -> String {
+        match err.kind() {
+            ErrorKind::Connection(msg) => msg.clone(),
+            other => panic!("expected a connection error, got {:?}", other),
+        }
     }
 
     struct StaticCookie;
@@ -1433,6 +1701,212 @@ mod tests {
         );
 
         blackhole.join().unwrap();
+    }
+
+    #[test]
+    fn recv_reads_a_well_formed_response() {
+        // Control for the rest of this group. Note the trailing EOL, which Content-Length
+        // covers but the JSON payload does not include.
+        let body = json!({"result": 42, "error": null, "id": 1}).to_string();
+        let payload = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}\n",
+            body.len() + 1,
+            body
+        );
+
+        let (mut connection, server) = fake_daemon(secs(5), move |mut socket| {
+            socket.write_all(payload.as_bytes()).unwrap();
+            thread::sleep(millis(200));
+        });
+
+        assert_eq!(connection.recv().unwrap(), body);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn recv_rejects_an_endless_header_stream() {
+        let (mut connection, server) = fake_daemon(secs(10), |mut socket| {
+            let _ = socket.write_all(b"HTTP/1.1 200 OK\r\n");
+            while socket.write_all(b"X-Filler: aaaaaaaaaaaaaaaaaaaaaaaaaaaa\r\n").is_ok() {}
+        });
+
+        let err = connection.recv().unwrap_err();
+        let msg = connection_error(&err);
+        assert!(
+            msg.contains("too many response headers") || msg.contains("headers exceed cap"),
+            "expected a header cap error, got {:?}",
+            msg
+        );
+
+        drop(connection);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn recv_rejects_an_oversized_header_line() {
+        // The per-line budget is checked before the buffer grows, so one enormous header is
+        // refused rather than allocated.
+        let oversized = *DAEMON_MAX_HEADER_LINE_BYTES + 1;
+        let (mut connection, server) = fake_daemon(secs(10), move |mut socket| {
+            let _ = socket.write_all(b"HTTP/1.1 200 OK\r\nX-Filler: ");
+            let chunk = vec![b'a'; 1024];
+            let mut sent = 0;
+            while sent < oversized && socket.write_all(&chunk).is_ok() {
+                sent += chunk.len();
+            }
+        });
+
+        let err = connection.recv().unwrap_err();
+        let msg = connection_error(&err);
+        assert!(
+            msg.contains("line exceeds cap"),
+            "expected a line cap error, got {:?}",
+            msg
+        );
+
+        drop(connection);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn recv_rejects_a_body_larger_than_the_cap() {
+        // The declared length is refused before a single body byte is read.
+        let payload = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
+            *DAEMON_MAX_BODY_BYTES + 1
+        );
+        let (mut connection, server) = fake_daemon(secs(5), move |mut socket| {
+            let _ = socket.write_all(payload.as_bytes());
+            thread::sleep(millis(200));
+        });
+
+        let err = connection.recv().unwrap_err();
+        let msg = connection_error(&err);
+        assert!(
+            msg.contains("body exceeds cap"),
+            "expected a body cap error, got {:?}",
+            msg
+        );
+
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn recv_rejects_a_zero_content_length() {
+        // `Content-Length: 0` used to underflow `contents_length - 1`.
+        let (mut connection, server) = fake_daemon(secs(5), |mut socket| {
+            let _ = socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+            thread::sleep(millis(200));
+        });
+
+        let err = connection.recv().unwrap_err();
+        let msg = connection_error(&err);
+        assert!(
+            msg.contains("content_length='0'"),
+            "expected an empty body error, got {:?}",
+            msg
+        );
+
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn recv_gives_up_on_a_drip_feeding_daemon() {
+        // A peer that sends something before each per-syscall timeout elapses never trips it,
+        // so only the whole-request deadline releases the worker.
+        let (mut connection, server) = fake_daemon(secs(1), |mut socket| {
+            let _ = socket.write_all(b"HTTP/1.1 200 OK\r\n");
+            for _ in 0..200 {
+                if socket.write_all(b"X").is_err() || socket.flush().is_err() {
+                    return;
+                }
+                thread::sleep(millis(100));
+            }
+        });
+
+        let started = Instant::now();
+        let err = connection.recv().unwrap_err();
+        let elapsed = started.elapsed();
+
+        let msg = connection_error(&err);
+        assert!(
+            msg.contains("deadline exceeded"),
+            "expected a deadline error, got {:?}",
+            msg
+        );
+        assert!(
+            elapsed >= secs(1) && elapsed < millis(1500),
+            "recv should give up at the request deadline, took {:?}",
+            elapsed
+        );
+
+        drop(connection);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn recv_deadline_is_not_extended_by_a_write_just_before_it_expires() {
+        // A byte arriving at 900ms used to pass the between-reads deadline check and then
+        // block for another whole socket timeout, so a 1s budget bought the peer nearly 2s.
+        let (mut connection, server) = fake_daemon(secs(1), |mut socket| {
+            let _ = socket.write_all(b"HTTP/1.1 200 OK\r\n");
+            let _ = socket.flush();
+            thread::sleep(millis(900));
+            let _ = socket.write_all(b"X");
+            let _ = socket.flush();
+            wait_for_close(socket);
+        });
+
+        let started = Instant::now();
+        let err = connection.recv().unwrap_err();
+        let elapsed = started.elapsed();
+
+        let msg = connection_error(&err);
+        assert!(
+            msg.contains("deadline exceeded"),
+            "expected a deadline error, got {:?}",
+            msg
+        );
+        assert!(
+            elapsed < millis(1500),
+            "recv should stop at the 1s budget rather than extend it, took {:?}",
+            elapsed
+        );
+
+        drop(connection);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn recv_body_deadline_is_not_extended_by_a_write_just_before_it_expires() {
+        // Same as above for the body read, which is the one that handles multi-MB replies.
+        let (mut connection, server) = fake_daemon(secs(1), |mut socket| {
+            let _ = socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 1024\r\n\r\n");
+            let _ = socket.flush();
+            thread::sleep(millis(900));
+            let _ = socket.write_all(b"X");
+            let _ = socket.flush();
+            wait_for_close(socket);
+        });
+
+        let started = Instant::now();
+        let err = connection.recv().unwrap_err();
+        let elapsed = started.elapsed();
+
+        let msg = connection_error(&err);
+        assert!(
+            msg.contains("deadline exceeded"),
+            "expected a deadline error, got {:?}",
+            msg
+        );
+        assert!(
+            elapsed < millis(1500),
+            "recv should stop at the 1s budget rather than extend it, took {:?}",
+            elapsed
+        );
+
+        drop(connection);
+        server.join().unwrap();
     }
 
     #[test]
