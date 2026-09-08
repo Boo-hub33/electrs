@@ -183,6 +183,7 @@ struct Connection {
     txs_limit: usize,
     subscription_limit: usize,
     max_request_bytes: usize,
+    checkpoint_proof_concurrency_limit: usize,
     #[cfg(feature = "electrum-discovery")]
     discovery: Option<Arc<DiscoveryManager>>,
     rpc_logging: RpcLogging,
@@ -206,6 +207,7 @@ impl Connection {
         txs_limit: usize,
         subscription_limit: usize,
         max_request_bytes: usize,
+        checkpoint_proof_concurrency_limit: usize,
         #[cfg(feature = "electrum-discovery")] discovery: Option<Arc<DiscoveryManager>>,
         rpc_logging: RpcLogging,
         salt: String,
@@ -221,6 +223,7 @@ impl Connection {
             txs_limit,
             subscription_limit,
             max_request_bytes,
+            checkpoint_proof_concurrency_limit,
             #[cfg(feature = "electrum-discovery")]
             discovery,
             rpc_logging,
@@ -309,7 +312,12 @@ impl Connection {
         if cp_height == 0 {
             return Ok(json!(raw_header_hex));
         }
-        let (branch, root) = get_header_merkle_proof(self.query.chain(), height, cp_height)?;
+        let (branch, root) = get_header_merkle_proof(
+            self.query.chain(),
+            height,
+            cp_height,
+            self.checkpoint_proof_concurrency_limit,
+        )?;
 
         Ok(json!({
             "header": raw_header_hex,
@@ -341,8 +349,12 @@ impl Connection {
             }));
         }
 
-        let (branch, root) =
-            get_header_merkle_proof(self.query.chain(), start_height + (count - 1), cp_height)?;
+        let (branch, root) = get_header_merkle_proof(
+            self.query.chain(),
+            start_height + (count - 1),
+            cp_height,
+            self.checkpoint_proof_concurrency_limit,
+        )?;
 
         Ok(json!({
             "count": headers.len(),
@@ -1238,6 +1250,7 @@ impl RPC {
         let txs_limit = config.electrum_txs_limit;
         let subscription_limit = config.electrum_subscription_limit;
         let max_request_bytes = config.electrum_rpc_max_request_num_bytes;
+        let checkpoint_proof_concurrency_limit = config.electrum_checkpoint_proof_concurrency_limit;
         let conn_max_age = config.electrum_rpc_conn_max_age;
 
         RPC {
@@ -1290,6 +1303,7 @@ impl RPC {
                             txs_limit,
                             subscription_limit,
                             max_request_bytes,
+                            checkpoint_proof_concurrency_limit,
                             #[cfg(feature = "electrum-discovery")]
                             discovery,
                             rpc_logging,

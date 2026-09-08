@@ -74,6 +74,7 @@ pub struct Config {
     pub utxos_limit: usize,
     pub electrum_txs_limit: usize,
     pub electrum_subscription_limit: usize,
+    pub electrum_checkpoint_proof_concurrency_limit: usize,
     pub electrum_banner: String,
     pub rpc_logging: RpcLogging,
     pub zmq_addr: Option<SocketAddr>,
@@ -291,6 +292,12 @@ impl Config {
                     .long("electrum-subscription-limit")
                     .help("Maximum number of scripthash subscriptions a single Electrum connection may hold. Every subscription costs a history lookup on each new block, so an unbounded count lets one client impose unbounded recurring work. Re-subscribing to an already-tracked scripthash is always allowed. 0 = unlimited.")
                     .default_value("10000")
+                    .takes_value(true)
+            ).arg(
+                Arg::with_name("electrum_checkpoint_proof_concurrency_limit")
+                    .long("electrum-checkpoint-proof-concurrency-limit")
+                    .help("Maximum number of blockchain.block.header(s) checkpoint Merkle proof builds (triggered by a non-zero cp_height) allowed to run at once, process-wide. Each build hashes every header from genesis up to cp_height, so an unbounded count lets concurrent cheap requests pin every CPU core. Requests past the cap fail immediately rather than queueing. 0 = reject all such requests.")
+                    .default_value("2")
                     .takes_value(true)
             ).arg(
                 Arg::with_name("electrum_banner")
@@ -589,6 +596,11 @@ impl Config {
             electrum_rpc_max_request_num_bytes,
             electrum_txs_limit: value_t_or_exit!(m, "electrum_txs_limit", usize),
             electrum_subscription_limit: value_t_or_exit!(m, "electrum_subscription_limit", usize),
+            electrum_checkpoint_proof_concurrency_limit: value_t_or_exit!(
+                m,
+                "electrum_checkpoint_proof_concurrency_limit",
+                usize
+            ),
             electrum_banner,
             rpc_logging: {
                 let params = RpcLogging {
