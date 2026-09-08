@@ -60,6 +60,7 @@ pub struct Config {
     pub cookie: Option<SensitiveAuth>,
     pub electrum_rpc_addr: SocketAddr,
     pub electrum_rpc_conn_max_age: Option<Duration>,
+    pub electrum_rpc_max_request_num_bytes: usize,
     pub http_addr: SocketAddr,
     pub http_socket_file: Option<PathBuf>,
     pub monitoring_addr: SocketAddr,
@@ -191,6 +192,13 @@ impl Config {
                     .long("electrum-rpc-conn-max-age")
                     .help("Maximum age (in seconds) of inbound Electrum RPC TCP connections. Each connection is closed at a randomly selected age between 50% and 100% of this value so clients reconnect gradually and load balancers can redistribute them. 0 = unlimited / never disconnect (default)")
                     .default_value("0")
+                    .takes_value(true),
+            )
+            .arg(
+                Arg::with_name("electrum_rpc_max_request_num_bytes")
+                    .long("electrum-rpc-max-request-num-bytes")
+                    .help("Maximum size (in bytes) of a single Electrum RPC request line. A client streaming bytes without a newline is disconnected once its in-flight line exceeds this size, bounding per-connection memory. 0 = unlimited (default: 1048576, i.e. 1 MiB)")
+                    .default_value("1048576")
                     .takes_value(true),
             )
             .arg(
@@ -499,6 +507,14 @@ impl Config {
                 0 => None, // 0 = unlimited / never disconnect
                 secs => Some(Duration::from_secs(secs)),
             };
+        let electrum_rpc_max_request_num_bytes: usize = match value_t_or_exit!(
+            m,
+            "electrum_rpc_max_request_num_bytes",
+            usize
+        ) {
+            0 => usize::MAX, // 0 = unlimited
+            bytes => bytes,
+        };
         let http_addr: SocketAddr = str_to_socketaddr(
             m.value_of("http_addr")
                 .unwrap_or(&format!("127.0.0.1:{}", default_http_port)),
@@ -570,6 +586,7 @@ impl Config {
             utxos_limit: value_t_or_exit!(m, "utxos_limit", usize),
             electrum_rpc_addr,
             electrum_rpc_conn_max_age,
+            electrum_rpc_max_request_num_bytes,
             electrum_txs_limit: value_t_or_exit!(m, "electrum_txs_limit", usize),
             electrum_subscription_limit: value_t_or_exit!(m, "electrum_subscription_limit", usize),
             electrum_banner,
